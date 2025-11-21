@@ -1,0 +1,733 @@
+import sys
+import torch
+import cv2
+import os
+import numpy as np
+from pathlib import Path
+# 确保从 PySide6.QtWidgets 导入 QLabel
+from PySide6.QtWidgets import QApplication, QMainWindow, QFileDialog, QLabel
+# 确保从 PySide6.QtGui 导入 QPixmap 和 QImage
+from PySide6.QtGui import QPixmap, QImage
+# 确保从 PySide6.QtCore 导入 QTimer, QThread, Signal, Slot, Qt, QObject
+from PySide6.QtCore import QTimer, QThread, Signal, Slot, Qt, QObject
+# 从编译的 UI 文件导入界面类
+from main_window_ui import Ui_MainWindow
+
+# --- Helper Function ---
+# 假设 convert2img 接收 RGB numpy 数组并返回 QImage
+def convert2img(img_rgb_np):
+    """Converts an RGB NumPy array to QImage."""
+    if not isinstance(img_rgb_np, np.ndarray):
+        print("Error: convert2img expects a numpy array.")
+        return QImage()
+
+    # Ensure the array is C-contiguous for QImage constructor
+    if not img_rgb_np.flags['C_CONTIGUOUS']:
+        img_rgb_np = np.ascontiguousarray(img_rgb_np)
+
+    # Handle different channel counts if necessary (though RGB888 is 3 channels)
+    if len(img_rgb_np.shape) != 3 or img_rgb_np.shape[2] != 3:
+         print(f"Error: convert2img expects 3 channels (RGB), but got {img_rgb_np.shape[2]}.")
+         # Basic handling for grayscale if needed, otherwise return invalid QImage
+         if img_rgb_np.shape[2] == 1:
+             return QImage(img_rgb_np.data, img_rgb_np.shape[1], img_rgb_np.shape[0], img_rgb_np.shape[1], QImage.Format.Format_Grayscale8)
+         else:
+             return QImage()
+
+
+    height, width, channel = img_rgb_np.shape
+    bytesPerLine = channel * width
+    # Use Format_RGB888 for RGB input
+    return QImage(img_rgb_np.data, width, height, bytesPerLine, QImage.Format.Format_RGB888)
+
+# --- Thread for Model Loading ---
+class ModelLoadingThread(QThread):
+    # Signal emitted on successful model load, carries the model object
+    model_loaded = Signal(object)
+    # User defined signal name for load error, carries error message
+    model_load_error = Signal(str) # Using user's defined signal name
+
+    def __init__(self, repo_path, weights_path, parent=None):
+        super().__init__(parent)
+        self.repo_path = repo_path
+        self.weights_path = weights_path
+        self._is_running = True
+
+    def run(self):
+        print("ModelLoadingThread(线程): 模型加载线程启动...")
+        try:
+            # Using the user specified custom function name
+            # Using the user specified path argument name
+            model = torch.hub.load(
+                self.repo_path,
+                'custom', # Your hubconf.py entrypoint
+                path=self.weights_path, # Pass the weights path to your custom entrypoint
+                source='local' # Load from local repository
+            )
+            if self._is_running:
+                 self.model_loaded.emit(model)
+            print("ModelLoadingThread(线程): 模型加载线程完成。")
+        except Exception as e:
+            if self._is_running:
+                 # Emit the user defined error signal name
+                 self.model_load_error.emit(f"Model loading failed: {e}")
+            print(f"ModelLoadingThread(线程) 出错: {e}")
+
+    def stop(self):
+        """Provides a way to signal the thread to stop."""
+        self._is_running = False
+        print("ModelLoadingThread(线程): 收到停止请求。")
+        # For simple run methods, setting the flag is often enough.
+
+
+# --- Thread for Image Detection ---
+class ImageDetectionThread(QThread):
+    # Signal emitted when detection is finished, carries the annotated image (NumPy array, presumed RGB)
+    detection_finished = Signal(np.ndarray)
+    # Signal emitted on detection error, carries error message
+    detection_error = Signal(str)
+
+    def __init__(self, model, image_path, parent=None):
+        super().__init__(parent)
+        self.model = model
+        self.image_path = image_path
+        self._is_running = True
+
+    def run(self):
+        print(f"ImageDetectionThread(线程): 图片检测线程启动，处理文件: {self.image_path}")
+        if self.model is None:
+            if self._is_running:
+                 self.detection_error.emit("模型未加载，无法检测。")
+            print("ImageDetectionThread(线程): 模型未加载，线程结束。")
+            return
+
+        try:
+            # Perform detection using the model. Model handles loading from path.
+            results = self.model(self.image_path)
+            print("ImageDetectionThread(线程): 模型推理完成。")
+
+            if not self._is_running:
+                 print("ImageDetectionThread(线程): 收到停止信号，提前退出。")
+                 return
+
+            # Render results. Assumed to return a list containing a NumPy array.
+            render_results = results.render()
+            print(f"ImageDetectionThread(线程): render() 返回结果类型: {type(render_results)}, 长度: {len(render_results)}")
+
+            if len(render_results) == 0:
+                 print("ImageDetectionThread(线程) 警告: render() 返回空结果。")
+                 if self._is_running:
+                      self.detection_error.emit("检测结果为空或处理失败。")
+                 return
+
+            # Get the annotated image NumPy array
+            annotated_image_np = render_results[0]
+            print(f"ImageDetectionThread(线程): render_results[0] 类型: {type(annotated_image_np)}, shape: {annotated_image_np.shape}, dtype: {annotated_image_np.dtype}")
+
+
+            # Ensure the array is writeable for QImage conversion in the main thread
+            if not annotated_image_np.flags.writeable:
+                 print("ImageDetectionThread(线程): render() 返回的数组是只读的，创建副本。")
+                 annotated_image_np = np.copy(annotated_image_np)
+            else:
+                 print("ImageDetectionThread(线程): render() 返回的数组是可写的。")
+
+
+            # Emit the finished signal with the annotated image (NumPy array, presumed RGB)
+            if self._is_running:
+                 self.detection_finished.emit(annotated_image_np)
+                 print("ImageDetectionThread(线程): 已发射检测完成信号。")
+
+            print("ImageDetectionThread(线程): 线程完成。")
+
+        except Exception as e:
+            print(f"ImageDetectionThread(线程) 出错: {e}")
+            if self._is_running:
+                 self.detection_error.emit(f"Image detection error: {e}")
+
+    def stop(self):
+        """Provides a way to signal the thread to stop."""
+        self._is_running = False
+        print("ImageDetectionThread(线程): 收到停止请求。")
+
+
+# --- Worker for Video Frame Detection (runs in a QThread) ---
+# Inherit from QObject as it will run inside a QThread
+class VideoDetectionWorker(QObject):
+    # Signal emitted when single frame detection is finished, carries annotated frame (NumPy array, presumed RGB)
+    detection_finished = Signal(np.ndarray)
+    # Signal emitted on detection error for a frame, carries error message
+    detection_error = Signal(str)
+
+    def __init__(self, model, parent=None):
+        super().__init__(parent)
+        self.model = model
+        self._is_running = True # Flag to control processing loop
+
+    # Slot to receive BGR frames from the main thread
+    @Slot(np.ndarray)
+    def process_frame(self, frame_bgr_np):
+        """Receives a BGR frame, performs detection, and emits result."""
+        # This method runs in the QThread it's moved to.
+        print("VideoDetectionWorker(工作者): 收到一帧待处理。")
+
+        if not self._is_running:
+             print("VideoDetectionWorker(工作者): 收到停止信号，停止处理帧。")
+             return # Stop processing if requested
+
+        if self.model is None:
+             print("VideoDetectionWorker(工作者): 模型未加载，无法检测。")
+             if self._is_running:
+                  self.detection_error.emit("Model is not loaded.") # Emit error if model is None
+             return
+
+        # Check if the input frame is invalid (None or not a numpy array)
+        # Corrected condition: should be 'not isinstance'
+        if frame_bgr_np is None or not isinstance(frame_bgr_np, np.ndarray):
+            print("VideoDetectionWorker(工作者) 警告: 接收到无效帧数据 (None 或不是 numpy 数组)。")
+            if self._is_running:
+                 # Emit a more accurate error message
+                 self.detection_error.emit("Received invalid frame data.")
+            return
+
+        try:
+            # Perform detection using the model, input is the original BGR NumPy array
+            print("VideoDetectionWorker(工作者): 开始模型推理。")
+            # Assuming model(numpy_array) is supported by AutoShape wrapper
+            results = self.model(frame_bgr_np)
+            print("VideoDetectionWorker(工作者): 模型推理完成。")
+
+
+            if not self._is_running: # Check stop flag again after potentially long operation
+                 print("VideoDetectionWorker(工作者): 收到停止信号，提前退出。")
+                 return
+
+            # Render results. Assumed to return a list containing a NumPy array.
+            render_results = results.render()
+            print(f"VideoDetectionWorker(工作者): render() 返回结果类型: {type(render_results)}, 长度: {len(render_results)}")
+
+            if len(render_results) == 0:
+                 print("VideoDetectionWorker(工作者) 警告: render() 返回空结果。")
+                 # If render returns empty, just return, no result signal emitted for this frame
+                 return
+
+            # Get the annotated frame NumPy array
+            annotated_frame_np = render_results[0]
+            print(f"VideoDetectionWorker(工作者): render_results[0] 类型: {type(annotated_frame_np)}, shape: {annotated_frame_np.shape}, dtype: {annotated_frame_np.dtype}")
+
+
+            # Ensure the array is writeable for QImage conversion in the main thread
+            if not annotated_frame_np.flags.writeable:
+                 print("VideoDetectionWorker(工作者): render() 返回的数组是只读的，创建副本。")
+                 annotated_frame_np = np.copy(annotated_frame_np)
+            else:
+                 print("VideoDetectionWorker(工作者): render() 返回的数组是可写的。")
+
+
+            # Emit the finished signal with the annotated frame (NumPy array, presumed RGB by render())
+            if self._is_running:
+                 self.detection_finished.emit(annotated_frame_np)
+                 print("VideoDetectionWorker(工作者): 已发射检测完成信号。")
+
+
+        except Exception as e:
+            print(f"VideoDetectionWorker(工作者) 处理帧时发生异常: {e}")
+            # Emit error signal on exception for a frame
+            if self._is_running:
+                 self.detection_error.emit(f"Frame processing error: {e}")
+
+
+    def stop(self):
+        """Provides a way to tell the worker to stop processing."""
+        print("VideoDetectionWorker(工作者): 收到停止请求。")
+        self._is_running = False
+        # For event-driven workers (receiving signals), setting the flag and returning from the slot is the way to stop new work.
+        # The thread's event loop (started by thread.start()) keeps it alive until thread.quit() is called.
+
+
+# --- MainWindow Class ---
+# Import the generated UI class
+from main_window_ui import Ui_MainWindow
+
+class MainWindow(QMainWindow, Ui_MainWindow):
+    # Signal emitted by MainWindow to send BGR frames to the video detection worker's slot
+    process_video_frame_signal = Signal(np.ndarray)
+
+    def __init__(self):
+        super().__init__()
+        # Set up the UI from the generated class (creates UI elements)
+        self.setupUi(self)
+        # Set window title (can also be done in UI Designer)
+        self.setWindowTitle("YOLOv5 Detection Application") # Consistent title
+
+        # Timer for video playback (runs in the main UI thread)
+        self.timer = QTimer(self)
+        # Connect the timer timeout signal to the slot that reads and sends the next video frame
+        # The slot itself (vedio_detect) runs in the main UI thread
+        self.timer.timeout.connect(self.vedio_detect)
+
+
+        # OpenCV VideoCapture object, initially None
+        self.video = None
+
+
+        # --- Robust path handling ---
+        # Get the directory where the script is located
+        self.script_dir = str(Path(__file__).resolve().parent)
+        # Assume YOLOv5 repository root is the script directory
+        self.yolov5_repo_path = self.script_dir # Consistent variable name
+        # Path to the model weights relative to the repository root
+        self.weights_path = "runs/train/exp16/weights/best.pt" # Consistent variable name
+
+
+        # --- Model object, initially None. Will be set when model loading thread finishes. ---
+        self.model = None
+
+        # --- Initialize all Thread and Worker objects to None ---
+        # These will be created and started later in the process (model loading finishes, or in on_model_loaded)
+        self.model_loading_thread = None
+        self.image_detection_thread = None
+        # Consistent variable name for the thread running the video worker
+        self.video_detection_worker_thread = None
+        # Consistent variable name for the video detection worker object
+        self.video_detection_worker = None
+
+
+        # --- Create and start Model Loading Thread ---
+        # Create the model loading thread instance
+        self.model_loading_thread = ModelLoadingThread(self.yolov5_repo_path, self.weights_path)
+
+        # Connect Model Loading Thread signals to MainWindow slots
+        # Connect the signal emitted on successful load
+        self.model_loading_thread.model_loaded.connect(self.on_model_loaded)
+        # Connect to the user defined error signal name (model_load_error)
+        # Connect to the user defined error slot name (on_model_load_error)
+        self.model_loading_thread.model_load_error.connect(self.on_model_load_error)
+
+
+        # --- Initial UI State: Disable detection buttons and show loading message ---
+        # Disable buttons until the model is loaded
+        # Use hasattr check for robustness (though setupUi should guarantee existence)
+        if hasattr(self.img_detect, 'setEnabled'):
+            self.img_detect.setEnabled(False)
+        if hasattr(self.video_detect, 'setEnabled'):
+            self.video_detect.setEnabled(False)
+
+        # Display loading status text in the labels
+        if isinstance(self.input, QLabel):
+             self.input.setText("正在加载模型...")
+        if isinstance(self.output, QLabel):
+             self.output.setText("正在加载模型...")
+
+        # Start the model loading thread. Its run method executes in a new thread.
+        self.model_loading_thread.start()
+
+
+        # --- Binding Button Click Events to Slots ---
+        # Ensure bind_buttons method is called
+        self.bind_buttons()
+        # Note: timer.timeout is connected in __init__ as shown above
+
+
+    # --- Model Loading Slots (Executed in the main UI thread) ---
+    @Slot(object) # Receives the loaded model object
+    def on_model_loaded(self, model):
+        """Slot connected to ModelLoadingThread.model_loaded signal."""
+        print("MainWindow(主线程): on_model_loaded 槽被调用。模型加载成功！")
+        # Store the loaded model object in a MainWindow attribute
+        self.model = model
+
+        # Enable detection buttons now that the model is ready
+        if hasattr(self.img_detect, 'setEnabled'):
+            self.img_detect.setEnabled(True)
+        if hasattr(self.video_detect, 'setEnabled'):
+            self.video_detect.setEnabled(True)
+
+        # Clear loading message, show initial prompt in labels
+        if isinstance(self.input, QLabel):
+             self.input.clear()
+             self.input.setText("请选择图片或视频进行检测")
+        if isinstance(self.output, QLabel):
+             self.output.clear()
+             self.output.setText("检测结果将显示在这里")
+
+        # --- Create and start Video Detection Worker Thread after model is loaded ---
+        # This part is done here because the VideoDetectionWorker needs the loaded model
+        print("MainWindow(主线程): 创建视频检测工作者线程...")
+        # Create the QThread instance that will run the worker's event loop
+        self.video_detection_worker_thread = QThread()
+        # Create the VideoDetectionWorker instance, passing the loaded model
+        self.video_detection_worker = VideoDetectionWorker(self.model)
+        # Move the worker object to the new thread. Its slots will now execute in that thread.
+        self.video_detection_worker.moveToThread(self.video_detection_worker_thread)
+
+        # Connect signals: Main thread signal -> Worker slot (frame processing)
+        # When MainWindow emits process_video_frame_signal, worker.process_frame is called in the worker thread
+        self.process_video_frame_signal.connect(self.video_detection_worker.process_frame)
+        # Connect signals: Worker signals -> Main thread slots (results and errors)
+        # When worker emits detection_finished, on_video_frame_detected is called in the main thread
+        self.video_detection_worker.detection_finished.connect(self.on_video_frame_detected)
+        # When worker emits detection_error, on_video_detection_error is called in the main thread
+        self.video_detection_worker.detection_error.connect(self.on_video_detection_error) # Assuming this slot exists
+
+        # Start the worker thread's event loop. This is necessary for slots in the worker object to be processed.
+        self.video_detection_worker_thread.start()
+        print("MainWindow(主线程): 视频检测工作者线程已启动。")
+
+        # Clean up the model loading thread once it has finished its run method
+        # isFinished() checks if the run method has completed
+        if self.model_loading_thread is not None and self.model_loading_thread.isFinished():
+             # wait() blocks until the thread's event loop has exited (quit()) or run method finished
+             self.model_loading_thread.wait()
+             # Dereference the thread object
+             self.model_loading_thread = None
+             print("MainWindow(主线程): 模型加载线程已清理。")
+        # else: print("MainWindow(主线程) 警告: 模型加载线程未完成或不存在，未清理。") # Optional warning
+
+
+    # User defined slot name for model load error
+    @Slot(str) # Receives the error message string
+    def on_model_load_error(self, error_message):
+        """Slot connected to ModelLoadingThread.model_load_error signal."""
+        print(f"MainWindow(主线程): on_model_load_error 槽被调用。模型加载错误: {error_message}")
+        # Display error message in the labels
+        if isinstance(self.input, QLabel): self.input.setText(f"加载错误: {error_message}")
+        if isinstance(self.output, QLabel): self.output.setText(f"加载错误: {error_message}")
+        # Buttons remain disabled (as they were initially)
+        if hasattr(self.img_detect, 'setEnabled'): self.img_detect.setEnabled(False)
+        if hasattr(self.video_detect, 'setEnabled'): self.video_detect.setEnabled(False)
+
+        # Clean up the model loading thread
+        if self.model_loading_thread is not None and self.model_loading_thread.isFinished():
+            self.model_loading_thread.wait()
+            self.model_loading_thread = None
+            print("MainWindow(主线程): 模型加载线程已清理。")
+        # else: print("MainWindow(主线程) 警告: 模型加载线程未完成或不存在，未清理。") # Optional warning
+
+
+    # --- Image Detection Thread Slots (Executed in the main UI thread) ---
+    @Slot(np.ndarray) # Receives the annotated image as a NumPy array
+    def on_image_detected(self, annotated_image_np):
+        """Slot connected to ImageDetectionThread.detection_finished signal."""
+        print("MainWindow(主线程): on_image_detected 槽被调用。图片检测完成，正在显示结果。")
+        # Ensure input is a NumPy array
+        if not isinstance(annotated_image_np, np.ndarray):
+             print("on_image_detected 警告: 接收到的不是 NumPy 数组。")
+             if isinstance(self.output, QLabel): self.output.setText("结果数据无效")
+             return
+
+        try:
+            # Convert the received NumPy array to QImage for display
+            # Assuming render() outputs BGR for the image, convert to RGB for convert2img (which expects RGB)
+            image_rgb_for_display = cv2.cvtColor(annotated_image_np, cv2.COLOR_BGR2RGB)
+            print("on_image_detected(主线程): 已将接收到的结果图像从 BGR 转换为 RGB。")
+
+            qimg = convert2img(image_rgb_for_display)
+            print(f"on_image_detected(主线程): convert2img 返回 QImage。 是否为空: {qimg.isNull()}")
+
+            # If the QImage is valid, convert to QPixmap and set to output label
+            if isinstance(self.output, QLabel) and not qimg.isNull():
+                 pixmap = QPixmap.fromImage(qimg)
+                 # Scale the pixmap to fit the label while maintaining aspect ratio
+                 label_width = self.output.width()
+                 label_height = self.output.height() # Corrected typo label_highet -> label_height
+                 # Scale the pixmap directly
+                 scaled_pixmap = pixmap.scaled(label_width, label_height, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                 self.output.setPixmap(scaled_pixmap)
+                 print("on_image_detected(主线程): 已显示检测结果到 output。")
+            else:
+                print("on_image_detected(主线程) 警告: output 不是 QLabel 类型或接收到的 QImage 为空，无法显示。")
+                if isinstance(self.output, QLabel): self.output.setText("无法显示检测结果")
+
+        except Exception as e:
+             print(f"on_image_detected(主线程) 槽处理中出错: {e}")
+             if isinstance(self.output, QLabel): self.output.setText(f"结果显示错误: {e}")
+
+        # Clean up the image detection thread once it has finished its run method
+        if self.image_detection_thread is not None and self.image_detection_thread.isFinished():
+             # wait() blocks until the thread's event loop has exited (quit()) or run method finished
+             self.image_detection_thread.wait()
+             # Dereference the thread object
+             self.image_detection_thread = None
+             print("MainWindow(主线程): 图片检测线程已清理。")
+        # else: print("MainWindow(主线程) 警告: 图片检测线程未完成或不存在。") # Optional warning
+
+
+    @Slot(str) # Receives the error message string
+    def on_image_detection_error(self, error_message):
+        """Slot connected to ImageDetectionThread.detection_error signal."""
+        print(f"MainWindow(主线程): on_image_detection_error 槽被调用。图片检测错误: {error_message}")
+        # Display error message in the output label
+        if isinstance(self.output, QLabel): self.output.setText(f"图片检测错误: {error_message}")
+
+        # Clean up the image detection thread
+        if self.image_detection_thread is not None and self.image_detection_thread.isFinished():
+            self.image_detection_thread.wait()
+            self.image_detection_thread = None
+            print("MainWindow(主线程): 图片检测线程已清理。")
+        # else: print("MainWindow(主线程) 警告: 图片检测线程未完成或不存在。") # Optional warning
+
+    # --- Video Detection Slots (Executed in the main UI thread) ---
+    @Slot(np.ndarray) # Receives the annotated frame as a NumPy array
+    def on_video_frame_detected(self, annotated_frame_np):
+        """Slot connected to VideoDetectionWorker.detection_finished signal."""
+        print("MainWindow(主线程): on_video_frame_detected 槽被调用。收到检测结果信号。")
+        # Ensure input is a NumPy array
+        if annotated_frame_np is None or not isinstance(annotated_frame_np, np.ndarray):
+             print("on_video_frame_detected(主线程) 警告: 接收到无效帧结果数据 (None 或不是 numpy 数组)。")
+             if isinstance(self.output, QLabel): self.output.clear(); self.output.setText("结果数据无效")
+             return
+
+        try:
+            # Convert the received NumPy array to QImage for display
+            # Assuming worker's render() outputs BGR, convert to RGB for convert2img (which expects RGB)
+            annotated_frame_rgb_for_display = cv2.cvtColor(annotated_frame_np, cv2.COLOR_BGR2RGB)
+            print("on_video_frame_detected(主线程): 已将接收到的结果图像从 BGR 转换为 RGB。")
+
+            qimg = convert2img(annotated_frame_rgb_for_display)
+            print(f"on_video_frame_detected(主线程): convert2img 返回 QImage。 是否为空: {qimg.isNull()}")
+
+            # If the QImage is valid, convert to QPixmap and set to output label
+            if isinstance(self.output, QLabel) and not qimg.isNull():
+                 pixmap = QPixmap.fromImage(qimg)
+                 # Scale the pixmap to fit the label while maintaining aspect ratio
+                 label_width = self.output.width()
+                 label_height = self.output.height() # Corrected typo label_highet -> label_height
+                 # Scale the pixmap directly
+                 scaled_pixmap = pixmap.scaled(label_width, label_height, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                 self.output.setPixmap(scaled_pixmap)
+                 # print("on_video_frame_detected(主线程): 已显示检测结果到 output。") # Optional print for every frame
+            else:
+                print("on_video_frame_detected(主线程) 警告: output 不是 QLabel 或接收到的 QImage 为空，无法显示。")
+                # If display fails for a frame, clear the output label
+                if isinstance(self.output, QLabel):
+                     self.output.clear()
+                     # self.output.setText("帧结果无法显示") # Optional text
+
+        except Exception as e:
+             print(f"on_video_frame_detected(主线程) 槽处理中发生异常: {e}")
+             # On error during processing/displaying a frame, clear output and show error message
+             if isinstance(self.output, QLabel):
+                  self.output.clear()
+                  self.output.setText(f"帧结果显示错误: {e}")
+
+
+    @Slot(str) # Receives the error message string
+    def on_video_detection_error(self, error_message):
+        """Slot connected to VideoDetectionWorker.detection_error signal."""
+        print(f"MainWindow(主线程): on_video_detection_error 槽被调用。视频检测错误: {error_message}")
+        # Display error message in output label
+        if isinstance(self.output, QLabel): self.output.setText(f"视频检测错误: {error_message}")
+        # Stop video playback on worker error
+        self.stop_video()
+
+
+    @Slot() # Connected to timer.timeout signal
+    def vedio_detect(self): # Method to process next video frame (spelling vedio->video is recommended)
+        """Reads the next video frame and sends it to the worker thread for processing."""
+        # Check if VideoCapture object is valid and opened
+        if not self.video or not self.video.isOpened():
+            print("vedio_detect(主线程): 视频捕获对象无效或已关闭。")
+            # Stop video playback and cleanup resources
+            self.stop_video()
+            return
+
+        # Read the next frame from the video (returns BGR NumPy array or None)
+        ret, frame_bgr = self.video.read()
+
+        # If frame was not read successfully (end of video or error)
+        if not ret:
+            print("vedio_detect(主线程): 无法读取到下一帧，视频结束或出错。")
+            # Stop video playback and cleanup resources
+            self.stop_video()
+            return
+
+        print("vedio_detect(主线程): 成功读取到一帧。")
+
+        # --- Display the original frame in the input label (in the main UI thread) ---
+        # Convert the BGR frame to RGB for display (QLabel/QImage expects RGB Format_RGB888)
+        frame_rgb_display = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        # Convert to QImage and set as Pixmap in the input label
+        self.input.setPixmap(QPixmap.fromImage(convert2img(frame_rgb_display)))
+        print("vedio_detect(主线程): 已显示原始帧到 input。")
+
+        # --- Send the original BGR frame to the worker thread for detection ---
+        # Check if the video detection worker thread and worker object are ready and running
+        if self.video_detection_worker_thread is not None and self.video_detection_worker_thread.isRunning() and self.video_detection_worker is not None:
+             # Emit the signal, passing the BGR NumPy array to the worker's process_frame slot
+             self.process_video_frame_signal.emit(frame_bgr)
+             # print("vedio_detect(主线程): 已将帧发送给工作者线程。") # Optional print for every frame
+        else:
+             print("vedio_detect(主线程) 警告: 视频检测工作线程未运行或未准备好，无法处理视频帧。")
+             # If worker is not ready, stop video playback
+             self.stop_video()
+
+
+    def open_video(self):
+        """Opens file dialog to select video and starts playback/detection."""
+        # Stop any existing video playback
+        self.stop_video()
+
+        # Check if the model is loaded before starting video detection
+        if self.model is None:
+            print("open_video: 模型未加载，请稍候。")
+            if isinstance(self.output, QLabel): self.output.setText("模型未加载...")
+            return
+
+        # Check if the video worker thread is ready (created and started in on_model_loaded)
+        # The worker is needed to process video frames
+        if self.video_detection_worker_thread is None or not self.video_detection_worker_thread.isRunning() or self.video_detection_worker is None:
+             print("open_video: 视频检测工作者线程未启动或未准备好，无法开始视频检测。")
+             if isinstance(self.output, QLabel): self.output.setText("视频工作者未就绪...")
+             # Can optionally try to restart the worker thread here if it was unexpectedly stopped
+             return
+
+
+        # Open file dialog to select video file
+        # Start in user's home directory for example
+        file_path_tuple = QFileDialog.getOpenFileName(self, "选择视频文件", str(Path.home()), "Video Files (*.mp4 *.avi *.mov)")
+
+        if file_path_tuple[0]: # Check if user selected a file
+            video_path = file_path_tuple[0]
+            print(f"open_video: 选择了视频: {video_path}")
+
+            # Get the absolute path of the selected video file
+            absolute_video_path = str(Path(video_path).resolve())
+
+            # Create a VideoCapture object
+            self.video = cv2.VideoCapture(absolute_video_path)
+
+            # Check if the video file was opened successfully
+            if not self.video.isOpened():
+                print(f"open_video 错误：无法打开视频文件: {absolute_video_path}")
+                if isinstance(self.input, QLabel): self.input.setText(f"无法打开视频: {os.path.basename(absolute_video_path)}")
+                if isinstance(self.output, QLabel): self.output.clear(); self.output.setText("检测结果将显示在这里")
+                self.video = None # Ensure video object is None
+                return
+
+            # Get video frame rate (FPS) and calculate timer interval
+            fps = self.video.get(cv2.CAP_PROP_FPS)
+            if fps > 0:
+                 # Calculate interval in milliseconds (ms = 1000 / FPS)
+                 # Use max(1, ...) to ensure interval is at least 1ms
+                 interval = max(1, int(1000 / fps))
+                 self.timer.setInterval(interval)
+                 print(f"open_video: 视频 FPS: {fps}, 设置定时器间隔为: {interval} ms")
+            else:
+                 # Use a default interval if FPS cannot be obtained or is zero (e.g., 33ms for ~30 FPS)
+                 default_interval = 33
+                 self.timer.setInterval(default_interval)
+                 print(f"open_video 警告: 无法获取视频 FPS，使用默认定时器间隔: {default_interval} ms")
+
+
+            # Clear previous content and set status text
+            if isinstance(self.input, QLabel): self.input.clear()
+            if isinstance(self.output, QLabel): self.output.clear(); self.output.setText("正在进行视频检测...")
+
+            # Start the timer to trigger vedio_detect periodically
+            self.timer.start()
+            print("open_video: 定时器已启动。")
+
+    def stop_video(self):
+        """Stops the video playback timer and releases the VideoCapture object."""
+        print("stop_video: 正在停止视频播放...")
+        # Stop the timer
+        self.timer.stop()
+        # Release the VideoCapture object if it exists and is opened
+        if self.video is not None and self.video.isOpened():
+            self.video.release()
+            print("stop_video: 视频捕获对象已释放。")
+        # Dereference the video object
+        self.video = None
+        # Optional: Clear output label display
+        # if isinstance(self.output, QLabel): self.output.clear(); self.output.setText("检测结果将显示在这里")
+
+
+    def bind_buttons(self):
+        """Connects UI button clicked signals to their respective slots."""
+        # Connect image detection button to open_image slot
+        self.img_detect.clicked.connect(self.open_image)
+        # Connect video detection button to open_video slot
+        self.video_detect.clicked.connect(self.open_video)
+        # timer.timeout signal is connected to vedio_detect in __init__
+
+
+    def closeEvent(self, event):
+        """Handles the application close event, ensures resources are released."""
+        print("closeEvent: 应用正在关闭...")
+        # Stop video playback and release VideoCapture object
+        self.stop_video()
+
+        # --- Clean up video detection worker thread ---
+        # Check if the worker thread exists and is running
+        if self.video_detection_worker_thread is not None and self.video_detection_worker_thread.isRunning():
+             print("closeEvent: 正在停止视频检测工作者线程...")
+             # Signal the worker object to stop its internal processing loops (if any)
+             if self.video_detection_worker is not None:
+                  self.video_detection_worker.stop()
+             # Request the thread's event loop to exit
+             self.video_detection_worker_thread.quit()
+             # Wait for the thread to finish its execution (run method exits)
+             self.video_detection_worker_thread.wait()
+             # Dereference the objects
+             self.video_detection_worker_thread = None
+             self.video_detection_worker = None
+             print("closeEvent: 视频检测工作者线程已停止并释放。")
+        # else: print("closeEvent 警告: 视频检测工作者线程不存在或未运行。") # Optional warning
+
+
+        # --- Clean up image detection thread ---
+        # Check if the image detection thread exists and is running
+        if self.image_detection_thread is not None and self.image_detection_thread.isRunning():
+            print("closeEvent: 正在停止图片检测线程...")
+            # Signal the thread to stop its run method
+            self.image_detection_thread.stop()
+            # Wait for the thread to finish
+            self.image_detection_thread.wait()
+            # Dereference the thread object
+            self.image_detection_thread = None
+            print("closeEvent: 图片检测线程已停止。")
+        # else: print("closeEvent 警告: 图片检测线程不存在或未运行。") # Optional warning
+
+
+        # --- Clean up model loading thread ---
+        # Check if the model loading thread exists and is running
+        if self.model_loading_thread is not None and self.model_loading_thread.isRunning():
+            print("closeEvent: 正在停止模型加载线程...")
+            # Signal the thread to stop its run method
+            self.model_loading_thread.stop()
+            # Wait for the thread to finish
+            self.model_loading_thread.wait()
+            # Dereference the thread object
+            self.model_loading_thread = None
+            print("closeEvent: 模型加载线程已停止。")
+        # else: print("closeEvent 警告: 模型加载线程不存在或未运行。") # Optional warning
+
+
+        # Accept the close event to allow the window to close
+        event.accept()
+
+
+# --- Application Entry Point ---
+if __name__ == "__main__":
+    # Ensure the start method is 'spawn' on Windows for multiprocessing compatibility
+    # This is often necessary when using PyTorch and multiprocessing/threading on Windows
+    if sys.platform.startswith('win'):
+        try:
+            # Check if the start method is already set to 'spawn'
+            if torch.multiprocessing.get_start_method(allow_none=True) != 'spawn':
+                 torch.multiprocessing.set_start_method('spawn', force=True)
+                 print("Set multiprocessing start method to 'spawn'.")
+        except RuntimeError as e:
+            print(f"Could not set multiprocessing start method: {e}")
+            # Handle the case where start method is already set (e.g., in a debugger)
+
+
+    # Create the QApplication instance
+    app = QApplication(sys.argv)
+    # Create the main window instance
+    window = MainWindow()
+    # Show the main window
+    window.show()
+    # Start the application's event loop. This blocks until the application exits.
+    sys.exit(app.exec()) # Use exec() instead of deprecated exec_()

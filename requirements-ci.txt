@@ -1,6 +1,7 @@
 # --- 核心依赖 ---
 # 注意：这里不写 torch 和 torchvision，因为我们在 YAML 里单独用命令装 CPU 版
-numpy>=1.18.5
+numpy<2.0.0
+ipython
 opencv-python-headless>=4.1.1  # 专为服务器环境设计的 OpenCV，不带 GUI，更稳
 Pillow>=7.1.2
 PyYAML>=5.3.1

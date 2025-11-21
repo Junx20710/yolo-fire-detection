@@ -33,7 +33,7 @@ jobs:
           if [ -f requirements-ci.txt ]; then pip install -r requirements-ci.txt; fi
 
       - name: Run Tests
-        run: pytest tests/test_yolo_integration.py -v
+        run: pytest tests/ -v
 
   # === 任务 2: CD (构建与发布) ===
   build-and-push:

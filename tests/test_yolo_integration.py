@@ -34,7 +34,7 @@ def test_dependency_imports():
 def test_model_forward_pass():
 
     #A.准备权重
-    weights = ROOT/ 'runs/train/yolov5+se/weights/best.pt'
+    weights = ROOT/ 'yolov5s.pt'
     
     if not os.path.exists(weights):
         torch.hub.download_url_to_file(
